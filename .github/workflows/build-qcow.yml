@@ -1,0 +1,74 @@
+name: Build QCOW2 Image from Podman
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  build-disk-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install QEMU and Disk Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils e2fsprogs
+
+      - name: Build Podman Image & Export RootFS
+        run: |
+          # 1. Build your container image (uses Dockerfile in repository root)
+          podman build -t gamebox-container .
+
+          # 2. Create temporary container and export rootfs to tarball
+          CONTAINER_ID=$(podman create gamebox-container)
+          podman export $CONTAINER_ID -o rootfs.tar
+          podman rm $CONTAINER_ID
+
+      - name: Create and Format Disk Image
+        run: |
+          # Create 10GB raw image
+          qemu-img create -f raw gamebox.raw 10G
+          mkfs.ext4 gamebox.raw
+
+          # Create mount point and attach via loop device
+          sudo mkdir -p /mnt/disk
+          sudo mount -o loop gamebox.raw /mnt/disk
+
+          # Extract rootfs into the disk
+          sudo tar -xf rootfs.tar -C /mnt/disk
+
+      - name: Install Kernel and GRUB inside RootFS
+        run: |
+          # Bind mount virtual filesystems for chroot
+          sudo mount --bind /dev /mnt/disk/dev
+          sudo mount --bind /proc /mnt/disk/proc
+          sudo mount --bind /sys /mnt/disk/sys
+
+          # Find available loop device used for the mount
+          LOOP_DEV=$(df /mnt/disk | tail -1 | awk '{print $1}')
+
+          # Chroot to update packages, install kernel, GRUB, and set root password
+          sudo chroot /mnt/disk /bin/bash -c "
+            apt-get update && apt-get install -y linux-image-generic grub-pc systemd-sysv
+            echo 'root:rootpassword' | chpasswd
+            grub-install $LOOP_DEV
+            update-grub
+          "
+
+          # Unmount filesystems safely
+          sudo umount -R /mnt/disk
+
+      - name: Convert Raw Image to QCOW2
+        run: |
+          qemu-img convert -f raw -O qcow2 gamebox.raw gamebox.qcow2
+
+      - name: Upload QCOW2 as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamebox-qcow2
+          path: gamebox.qcow2
+          retention-days: 7
